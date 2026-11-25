@@ -13,8 +13,11 @@ export DATA_DIR PUID PGID
 
 if [ "$(id -u)" = "0" ]; then
     mkdir -p "$DATA_DIR/uploads"
-    # Only walk the whole tree if the owner differs (e.g. first start or changed PUID).
-    if [ "$(stat -c '%u:%g' "$DATA_DIR")" != "$PUID:$PGID" ]; then
+    # Only walk the whole tree if something near the top has another owner (first
+    # start, changed PUID, or folders created by root such as uploads/ above).
+    # Checking only $DATA_DIR is not enough: Unraid creates the appdata folder
+    # already owned by 99:100, which left the root-made uploads/ unwritable.
+    if [ -n "$(find "$DATA_DIR" -maxdepth 2 \( ! -user "$PUID" -o ! -group "$PGID" \) -print -quit)" ]; then
         echo "Setting owner of $DATA_DIR to $PUID:$PGID"
         chown -R "$PUID:$PGID" "$DATA_DIR"
     fi

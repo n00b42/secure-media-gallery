@@ -756,20 +756,38 @@ class DeviceUnlock {
         pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
         authenticatorSelection: {
           authenticatorAttachment: 'platform',
-          residentKey: 'discouraged',
+          // Must be a discoverable passkey: on Android, non-discoverable credentials
+          // go to the legacy Play Services authenticator, which has no PRF support.
+          residentKey: 'required',
+          requireResidentKey: true,
           userVerification: 'required',
         },
         timeout: 60000,
         extensions: { prf: { eval: { first: salt } } },
       },
     });
-    const prf = credential.getClientExtensionResults()?.prf;
-    if (!prf || prf.enabled === false) {
-      throw new Error('This authenticator does not support the PRF extension needed for unlocking.');
-    }
     const credentialId = new Uint8Array(credential.rawId);
-    // Some authenticators only return PRF results on use, not on creation: ask once more.
-    const prfOutput = prf.results?.first || await this._prf(credentialId, salt);
+    const unsupported = () => {
+      // Drop the useless passkey from the device's list again (newer browsers only).
+      if (typeof PublicKeyCredential?.signalUnknownCredential === 'function') {
+        const id = e2e._buf2b64(credentialId).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        PublicKeyCredential.signalUnknownCredential({ rpId: location.hostname, credentialId: id }).catch(() => {});
+      }
+      return new Error('This authenticator does not support the PRF extension needed for unlocking.');
+    };
+    const prf = credential.getClientExtensionResults()?.prf;
+    if (prf?.enabled === false) throw unsupported();
+    // Some authenticators report nothing or only return PRF results on use,
+    // not on creation: ask once more before giving up.
+    let prfOutput = prf?.results?.first;
+    if (!prfOutput) {
+      try {
+        prfOutput = await this._prf(credentialId, salt);
+      } catch (err) {
+        if (err?.name === 'NotAllowedError') throw err;   // cancelled by the user
+        throw unsupported();
+      }
+    }
 
     const key = await this._aesKey(prfOutput, salt);
     const iv = crypto.getRandomValues(new Uint8Array(12));

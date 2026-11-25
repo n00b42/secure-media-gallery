@@ -74,10 +74,12 @@
     border-radius: 10px;
     font-size: 14px;
     gap: 10px;
+    /* On narrow screens the name gets its own line instead of a 1-char column. */
+    flex-wrap: wrap;
 }
 
 .file-item-main {
-    flex: 1;
+    flex: 1 1 220px;
     min-width: 0;
 }
 
@@ -180,7 +182,9 @@
 }
 
 .file-item-status {
-    min-width: 150px;
+    flex: 1 1 120px;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 /* Unfinished (resumable) uploads */
