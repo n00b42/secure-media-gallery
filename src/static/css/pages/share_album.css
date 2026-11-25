@@ -1,0 +1,94 @@
+.share-container {
+    max-width: 720px;
+    margin: 0 auto;
+    background: var(--surface-elevated);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: clamp(20px, 4vw, 30px);
+    box-shadow: var(--card-shadow);
+}
+
+.share-container h2 {
+    margin-bottom: 26px;
+    text-align: center;
+    color: var(--ink);
+}
+
+.share-form,
+.shared-users {
+    background: var(--surface-sunken);
+    padding: 20px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    margin-bottom: 24px;
+}
+
+.share-form h3,
+.shared-users h3 {
+    margin-bottom: 16px;
+    color: var(--ink);
+}
+
+.user-list {
+    list-style: none;
+}
+
+.user-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px;
+    background: var(--surface-elevated);
+    margin-bottom: 8px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--accent);
+}
+
+.user-info {
+    flex: 1;
+}
+
+.user-name {
+    font-weight: 700;
+    color: var(--ink);
+}
+
+.key-status {
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 20px;
+    margin-right: 10px;
+    font-weight: 600;
+}
+
+.key-status.pending {
+    background: var(--pending-bg);
+    color: var(--pending-fg);
+}
+
+.key-status.done {
+    background: var(--done-bg);
+    color: var(--done-fg);
+}
+
+.key-status.error {
+    background: var(--failed-bg);
+    color: var(--failed-fg);
+}
+
+.empty-state {
+    text-align: center;
+    padding: 30px 20px;
+    color: var(--muted);
+}
+
+.form-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.inline-form-reset {
+    margin: 0;
+}

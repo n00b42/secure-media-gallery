@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+
+{% block title %}Register - Secure Media Gallery{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="auth-card">
+        <h2>Create Account</h2>
+        <div id="register-error" class="alert error is-hidden" role="alert"></div>
+        <form id="register-form" method="POST" class="form-centered" novalidate
+              data-min-password-length="{{ min_password_length }}">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" autocomplete="username" autocapitalize="none"
+                       minlength="3" maxlength="80" pattern="[a-z0-9._\-]+" required>
+                <small>3–80 characters: a–z, 0–9, ".", "_", "-"</small>
+            </div>
+            <div class="form-group">
+                <label for="invite_key">Invite Key</label>
+                <input type="text" id="invite_key" name="invite_key" autocomplete="off" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" autocomplete="new-password"
+                       minlength="{{ min_password_length }}" required>
+                <small>At least {{ min_password_length }} characters. This password also protects your
+                    encryption key — if you forget it, your files cannot be recovered.</small>
+            </div>
+            <div class="form-group">
+                <label for="password_confirm">Confirm Password</label>
+                <input type="password" id="password_confirm" name="password_confirm" autocomplete="new-password" required>
+            </div>
+            <button type="submit" id="register-submit">Register</button>
+        </form>
+        <p class="mt-3 text-center">Already have an account? <a href="{{ url_for('auth.login') }}">Login here</a></p>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ csp_nonce }}">
+(() => {
+  const form = document.getElementById('register-form');
+  const errorEl = document.getElementById('register-error');
+  const submitBtn = document.getElementById('register-submit');
+  const MIN_PASSWORD_LENGTH = Number.parseInt(form.dataset.minPasswordLength, 10) || E2E_MIN_PASSWORD_LENGTH;
+
+  function showError(message) {
+    errorEl.textContent = message;
+    errorEl.classList.remove('is-hidden');
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    errorEl.classList.add('is-hidden');
+
+    const username = e2e.normalizeUsername(form.username.value);
+    const inviteKey = form.invite_key.value.trim();
+    const password = form.password.value;
+
+    if (!/^[a-z0-9._-]{3,80}$/.test(username)) {
+      showError('Username must be 3–80 characters: a–z, 0–9, ".", "_", "-".');
+      return;
+    }
+    if (!inviteKey) { showError('Invite key is required.'); return; }
+    const contextError = e2eSecureContextError();
+    if (contextError) { showError(contextError); return; }
+    // Enforced here because the server never sees the password (only a derived key).
+    if (password.length < MIN_PASSWORD_LENGTH) {
+      showError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+      return;
+    }
+    if (password !== form.password_confirm.value) { showError('Passwords do not match.'); return; }
+
+    submitBtn.disabled = true;
+    try {
+      submitBtn.textContent = 'Deriving keys…';
+      const { authKeyHex, wrapKeyB64 } = await e2e.deriveAccountKeys(username, password);
+
+      submitBtn.textContent = 'Generating encryption keys…';
+      const { publicKeyB64, wrappedPrivateKey } = await e2e.createWrappedKeyPair(wrapKeyB64);
+
+      submitBtn.textContent = 'Creating account…';
+      const { res, data } = await e2ePostJson(form.action || window.location.pathname, {
+        username,
+        invite_key: inviteKey,
+        auth_key: authKeyHex,
+        public_key: publicKeyB64,
+        wrapped_private_key: wrappedPrivateKey,
+      });
+      if (!res.ok || data.status !== 'ok') {
+        showError(data.error || `Registration failed (${res.status})`);
+        return;
+      }
+      e2e.saveSessionWrapKey(wrapKeyB64);
+      window.location.href = data.redirect;
+    } catch (err) {
+      console.error(err);
+      showError('Registration failed. Please try again.');
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Register';
+    }
+  });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,36 @@
+services:
+  web:
+    # Published image (GitHub Actions); "docker compose build" builds it locally instead.
+    image: ghcr.io/n00b42/secure-media-gallery:latest
+    build: .
+    ports:
+      # Only reachable from this host: put the HTTPS reverse proxy in front.
+      # Use "5000:5000" only if the container must be reachable directly.
+      - "127.0.0.1:5000:5000"
+    # Only deployment-specific settings belong here (values come from .env).
+    # The container's internal layout (APP_ENV, DATA_DIR=/data)
+    # is fixed in the Dockerfile and should not be overridden.
+    environment:
+      # Optional: if empty, a key is generated on first start and kept in /data.
+      SECRET_KEY: ${SECRET_KEY:-}
+      # Number of reverse proxies in front of the app (0 = reached directly)
+      TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-0}
+      # Set to false ONLY to test over http://localhost
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      # Upload limits (500M / 20G / 1T or bytes; 0 = unlimited)
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-0}
+      USER_STORAGE_QUOTA: ${USER_STORAGE_QUOTA:-0}
+      MIN_FREE_DISK_SPACE: ${MIN_FREE_DISK_SPACE:-1G}
+      UPLOAD_EXPIRY_HOURS: ${UPLOAD_EXPIRY_HOURS:-168}
+      ALBUM_OVERVIEW_THUMBNAILS_ENABLED: ${ALBUM_OVERVIEW_THUMBNAILS_ENABLED:-true}
+      # Owner of the data in the volume (Unraid: 99/100)
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      # Server tuning, e.g. "--workers 4 --threads 8"
+      GUNICORN_CMD_ARGS: ${GUNICORN_CMD_ARGS:-}
+    volumes:
+      - gallery-data:/data
+    restart: unless-stopped
+
+volumes:
+  gallery-data:

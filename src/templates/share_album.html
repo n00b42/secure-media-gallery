@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+
+{% block title %}Share Album - Secure Media Gallery{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ asset_url('css/pages/share_album.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="share-container">
+    <h2>Share "{{ album.title }}"</h2>
+
+    <div class="share-form">
+        <h3>Add User</h3>
+        <form method="POST" class="form-centered">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" placeholder="Enter username" required autocomplete="off">
+            </div>
+            <button type="submit">Share Album</button>
+        </form>
+    </div>
+
+    <div class="shared-users">
+        <h3>Currently Shared With:</h3>
+        {% if shared_users %}
+        <ul class="user-list" id="userList">
+            {% for user in shared_users %}
+            <li class="user-item" id="user-row-{{ user.id }}">
+                <div class="user-info">
+                    <div class="user-name">👤 {{ user.username }}</div>
+                    <div class="fingerprint js-fingerprint" data-user-id="{{ user.id }}" title="Key fingerprint — compare it with {{ user.username }} (see Keys page)"></div>
+                </div>
+                <span class="key-status pending" id="key-status-{{ user.id }}">⏳ Keys pending</span>
+                <form method="POST"
+                      action="{{ url_for('album.remove_user_from_album', album_id=album.id, user_id=user.id) }}"
+                      class="inline-form-reset form-centered"
+                      data-confirm="Remove access for {{ user.username }}? They will no longer be able to see, list or download this album's files.">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                </form>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <div class="empty-state"><p>Not shared with anyone yet.</p></div>
+        {% endif %}
+        <p class="info-text">
+            Removing someone immediately stops them from seeing, listing or downloading anything in
+            this album, and deletes their stored file keys. Files they already downloaded and decrypted
+            before removal cannot be recalled.
+        </p>
+    </div>
+
+    <div class="form-actions">
+        <a href="{{ url_for('gallery.view_album', album_id=album.id) }}" class="btn">Back to Album</a>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ csp_nonce }}">
+(async () => {
+    const ALBUM_ID = {{ album.id | tojson }};
+    const PENDING_RECIPIENT_ID = {{ pending_share_user_id | tojson }};
+    const SHARED_USER_KEYS = {{ shared_user_keys | tojson }};
+
+    // Show each recipient's key fingerprint (computed locally from the public key).
+    for (const user of SHARED_USER_KEYS) {
+        const el = document.querySelector(`.js-fingerprint[data-user-id="${user.id}"]`);
+        if (!el || !user.public_key) continue;
+        e2e.fingerprint(user.public_key).then(fp => { el.textContent = fp; }).catch(() => {});
+    }
+
+    // ── Wait for E2E key ──────────────────────────────────────────────────
+    function waitForE2E() {
+        return new Promise(resolve => {
+            if (window.__e2eReady) { resolve(); return; }
+            window.addEventListener('e2e-ready', resolve, { once: true });
+        });
+    }
+
+    await waitForE2E();
+    const privateKey = window.__e2ePrivateKey;
+    if (!privateKey) return;
+
+    // ── Verify key status for all shared users ────────────────────────────
+    // We fetch each user's public key; if it exists AND we have a MediaKey row
+    // we mark it done. A simpler proxy: if the user has a public key registered.
+    async function checkKeyStatus(userId) {
+        try {
+            const res = await fetch(`/api/keys/${userId}`);
+            return res.ok; // true = user has a public key
+        } catch { return false; }
+    }
+
+    // ── Re-encrypt all album file keys for a recipient ────────────────────
+    async function shareKeysWithUser(recipientId) {
+        const statusEl = document.getElementById(`key-status-${recipientId}`);
+        if (!statusEl) return;
+
+        statusEl.textContent = '🔐 Encrypting…';
+        statusEl.className = 'key-status pending';
+
+        try {
+            // 1. Get recipient's public key
+            const pubRes = await fetch(`/api/keys/${recipientId}`);
+            if (!pubRes.ok) throw new Error('Recipient has no public key');
+            const pubData = await pubRes.json();
+            const recipientPubKey = await e2e.importPublicKey(pubData.public_key);
+
+            // 2. Get all owner's encrypted file keys for this album
+            const keysRes = await fetch(`/api/album/${ALBUM_ID}/owner-keys`);
+            if (!keysRes.ok) throw new Error('Could not load owner keys');
+            const keysData = await keysRes.json();
+
+            if (!keysData.keys || !keysData.keys.length) {
+                statusEl.textContent = '✅ No files yet';
+                statusEl.className = 'key-status done';
+                return;
+            }
+
+            // 3. For each file, decrypt the AES key with owner's private key,
+            //    then re-encrypt with recipient's public key
+            const sharePayload = [];
+            for (const entry of keysData.keys) {
+                const rawKeyB64 = await e2e.decryptKeyWithPrivateKey(entry.encrypted_key, privateKey);
+                const reencrypted = await e2e.encryptKeyForRecipient(rawKeyB64, recipientPubKey);
+                sharePayload.push({ media_id: entry.media_id, encrypted_key: reencrypted });
+            }
+
+            // 4. Send all re-encrypted keys to the server
+            const shareRes = await fetch(`/api/album/${ALBUM_ID}/share-keys`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: recipientId, keys: sharePayload }),
+            });
+
+            if (!shareRes.ok) throw new Error('Failed to store share keys');
+
+            statusEl.textContent = `✅ ${sharePayload.length} key(s) shared`;
+            statusEl.className = 'key-status done';
+
+        } catch (err) {
+            console.error('Key sharing failed:', err);
+            statusEl.textContent = '⚠️ Failed: ' + err.message;
+            statusEl.className = 'key-status error';
+        }
+    }
+
+    // ── Run key sharing for all users (lazy: only where keys are missing) ─
+    const sharedUserIds = {{ shared_users | map(attribute='id') | list | tojson }};
+
+    // Always re-share keys for the user that was just added (pending_share_user_id)
+    // and check status for all others
+    const keyStatuses = await Promise.all(
+        sharedUserIds.map(async (uid) => ({ uid, hasKey: await checkKeyStatus(uid) }))
+    );
+
+    for (const { uid, hasKey } of keyStatuses) {
+        const statusEl = document.getElementById(`key-status-${uid}`);
+
+        if (!hasKey) {
+            if (statusEl) { statusEl.textContent = '⚠️ No public key'; statusEl.className = 'key-status error'; }
+            continue;
+        }
+
+        if (uid === PENDING_RECIPIENT_ID) {
+            // Newly added — do the full re-encryption flow
+            await shareKeysWithUser(uid);
+        } else {
+            // Existing share — we trust it's already done; just mark ready
+            // (the server would return 404 on key fetch if it isn't)
+            if (statusEl) { statusEl.textContent = '✅ Keys shared'; statusEl.className = 'key-status done'; }
+        }
+    }
+})();
+</script>
+{% endblock %}

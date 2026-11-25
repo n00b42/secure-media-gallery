@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+
+{% block title %}Login - Secure Media Gallery{% endblock %}
+
+{% block content %}
+<div class="auth-shell">
+    <div class="auth-card">
+        <h2>Welcome Back</h2>
+        <div id="login-error" class="alert error is-hidden" role="alert"></div>
+        <div id="device-login" class="device-login is-hidden">
+            <div id="device-login-buttons"></div>
+            <p class="device-login-or">or sign in with your password</p>
+        </div>
+        <form id="login-form" method="POST" class="form-centered" novalidate>
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" autocomplete="username" autocapitalize="none" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" autocomplete="current-password" required>
+            </div>
+            <button type="submit" id="login-submit">Login</button>
+        </form>
+        <p class="mt-3 text-center">Don't have an account? <a href="{{ url_for('auth.register') }}">Register here</a></p>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ csp_nonce }}">
+(() => {
+  const form = document.getElementById('login-form');
+  const errorEl = document.getElementById('login-error');
+  const submitBtn = document.getElementById('login-submit');
+
+  function showError(message) {
+    errorEl.textContent = message;
+    errorEl.classList.remove('is-hidden');
+  }
+
+  // ── Fingerprint sign-in (set up per device on the Keys page) ─────────────
+  // The fingerprint releases the saved auth key + wrap key; the login request
+  // is the same as with a password (and rate limited the same way).
+  async function deviceLogin(username, button) {
+    errorEl.classList.add('is-hidden');
+    const contextError = e2eSecureContextError();
+    if (contextError) { showError(contextError); return; }
+    button.disabled = true;
+    try {
+      const { authKeyHex, wrapKeyB64 } = await deviceUnlock.unlock(username);
+      const { res, data } = await e2ePostJson(form.action || window.location.pathname, {
+        username, auth_key: authKeyHex,
+      });
+      if (res.status === 401) {
+        deviceUnlock.remove(username);
+        renderDeviceLogin();
+        showError('The saved fingerprint sign-in no longer matches this account and was removed. ' +
+                  'Sign in with your password and set it up again on the Keys page.');
+        return;
+      }
+      if (!res.ok || data.status !== 'ok') {
+        showError(data.error || `Login failed (${res.status})`);
+        return;
+      }
+      e2e.saveSessionWrapKey(wrapKeyB64);
+      window.location.href = data.redirect;
+    } catch (err) {
+      showError(err.name === 'NotAllowedError'
+        ? 'Fingerprint check cancelled.'
+        : `Fingerprint sign-in failed: ${err.message}`);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function renderDeviceLogin() {
+    const box = document.getElementById('device-login');
+    const buttons = document.getElementById('device-login-buttons');
+    const usernames = window.PublicKeyCredential ? deviceUnlock.enrolledUsernames() : [];
+    buttons.replaceChildren(...usernames.map((username) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn device-unlock-btn';
+      button.textContent = `👆 Sign in as ${username} with fingerprint`;
+      button.addEventListener('click', () => deviceLogin(username, button));
+      return button;
+    }));
+    box.classList.toggle('is-hidden', usernames.length === 0);
+  }
+  renderDeviceLogin();
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    errorEl.classList.add('is-hidden');
+
+    const username = e2e.normalizeUsername(form.username.value);
+    const password = form.password.value;
+    if (!username || !password) { showError('Please enter username and password.'); return; }
+    const contextError = e2eSecureContextError();
+    if (contextError) { showError(contextError); return; }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Deriving keys…';
+    try {
+      // The password itself never leaves the browser. Only authKey is sent.
+      const { authKeyHex, wrapKeyB64 } = await e2e.deriveAccountKeys(username, password);
+      submitBtn.textContent = 'Logging in…';
+      const { res, data } = await e2ePostJson(form.action || window.location.pathname, {
+        username, auth_key: authKeyHex,
+      });
+
+      if (!res.ok || data.status !== 'ok') {
+        showError(data.error || `Login failed (${res.status})`);
+        return;
+      }
+
+      e2e.saveSessionWrapKey(wrapKeyB64);
+      window.location.href = data.redirect;
+    } catch (err) {
+      console.error(err);
+      showError('Login failed. Please try again.');
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Login';
+    }
+  });
+})();
+</script>
+{% endblock %}

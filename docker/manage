@@ -1,0 +1,5 @@
+#!/bin/sh
+# Management commands inside the container, run as the app user so files in the
+# data folder keep the right owner:   docker exec <container> manage create-invite
+APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+exec python "$APP_DIR/docker/run_as.py" python "$APP_DIR/src/manage.py" "$@"

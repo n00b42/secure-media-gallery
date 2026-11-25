@@ -1,0 +1,273 @@
+{% extends "base.html" %}
+
+{% block title %}Account - Secure Media Gallery{% endblock %}
+
+{% block content %}
+<div class="form-container">
+    <h2>👤 Account</h2>
+
+    <div class="keys-panel" id="password-panel">
+        <h3>🔑 Change password</h3>
+        <p>
+            Your password also protects your encryption key, so it is changed in the browser:
+            the key is re-encrypted with the new password. Other signed-in devices are signed out.
+            There is no password reset: if you forget it, your files can't be decrypted.
+        </p>
+        <div id="password-error" class="alert error is-hidden" role="alert"></div>
+        <div id="password-success" class="alert success is-hidden" role="status"></div>
+        <form id="password-form" class="form-centered" novalidate
+              data-min-password-length="{{ min_password_length }}">
+            <input type="text" name="username" value="{{ current_user.username }}" autocomplete="username" hidden>
+            <div class="form-group">
+                <label for="current-password">Current password</label>
+                <input type="password" id="current-password" autocomplete="current-password" required>
+            </div>
+            <div class="form-group">
+                <label for="new-password">New password</label>
+                <input type="password" id="new-password" autocomplete="new-password"
+                       minlength="{{ min_password_length }}" required>
+                <small>At least {{ min_password_length }} characters.</small>
+            </div>
+            <div class="form-group">
+                <label for="new-password-confirm">Repeat new password</label>
+                <input type="password" id="new-password-confirm" autocomplete="new-password" required>
+            </div>
+            <button type="submit" id="password-submit">Change password</button>
+        </form>
+    </div>
+
+    <div class="keys-panel" id="sessions-panel">
+        <h3>💻 Signed-in devices</h3>
+        <p>Browsers where you are signed in. Sign out any you don't recognise; that takes effect immediately.</p>
+        <ul class="session-list">
+            {% for device in devices %}
+            <li class="session-item">
+                <div>
+                    <div class="session-device">{{ device.device }}{% if device.current %} <span class="badge badge-shared">this browser</span>{% endif %}</div>
+                    <small>Signed in {{ device.created_at.strftime('%Y-%m-%d %H:%M') }} UTC · last active {{ device.last_seen_at.strftime('%Y-%m-%d %H:%M') }} UTC</small>
+                </div>
+                {% if not device.current %}
+                <form method="POST" action="{{ url_for('gallery.revoke_session', session_id=device.id) }}" class="inline-form-reset"
+                      data-confirm="Sign out {{ device.device }}?">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="btn btn-sm btn-danger">Sign out</button>
+                </form>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% if devices|length > 1 %}
+        <form method="POST" action="{{ url_for('gallery.revoke_other_sessions') }}" class="inline-form-reset"
+              data-confirm="Sign out all other devices?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-secondary btn-sm">Sign out all other devices</button>
+        </form>
+        {% endif %}
+    </div>
+
+    <div class="keys-panel" id="device-panel">
+        <h3>👆 Fingerprint unlock on this device</h3>
+        <p>
+            Sign in and unlock your encryption with your fingerprint, face or device PIN instead of
+            your password, on this device only. Your keys stay encrypted on the device and can only
+            be released by its fingerprint/face check, so the server learns nothing new. Anyone who
+            can unlock this device can also open your gallery on it.
+        </p>
+        <p id="device-status">Checking this device…</p>
+        <div id="device-enable" class="device-enable-row is-hidden">
+            <input type="password" id="device-password" placeholder="Confirm with your password"
+                   autocomplete="current-password">
+            <button type="button" id="device-enable-btn" class="btn">Enable</button>
+        </div>
+        <div id="device-error" class="alert error is-hidden" role="alert"></div>
+        <button type="button" id="device-remove-btn" class="btn btn-danger btn-sm is-hidden">
+            Remove from this device</button>
+    </div>
+
+    <div class="keys-panel">
+        <h3>Your key fingerprint</h3>
+        {% if my_public_key %}
+        <p class="fingerprint" id="my-fingerprint" data-public-key="{{ my_public_key }}">Computing…</p>
+        {% else %}
+        <p>Your encryption keys are not set up yet.</p>
+        {% endif %}
+    </div>
+
+    <div class="keys-panel">
+        <h3>People you share albums with</h3>
+        <p>
+            Files are encrypted for the public keys the server hands out. To make sure the
+            server (or anyone controlling it) has not swapped a key, compare these fingerprints
+            with the other person through a different channel — in person, by phone or in a
+            messenger. Each of you sees the same fingerprint for the same key. If a fingerprint
+            ever changes unexpectedly, stop sharing and ask why.
+        </p>
+        {% if contacts %}
+        <ul class="fingerprint-list">
+            {% for contact in contacts %}
+            <li>
+                <div class="fingerprint-user">👤 {{ contact.username }}</div>
+                {% if contact.public_key %}
+                <div class="fingerprint js-fingerprint" data-public-key="{{ contact.public_key }}">Computing…</div>
+                {% else %}
+                <div>No encryption key registered yet.</div>
+                {% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p><em>You are not sharing albums with anyone yet.</em></p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ csp_nonce }}">
+// ── Password change ─────────────────────────────────────────────────────
+(() => {
+    const form = document.getElementById('password-form');
+    const errorEl = document.getElementById('password-error');
+    const successEl = document.getElementById('password-success');
+    const submit = document.getElementById('password-submit');
+    const username = document.body.dataset.userUsername;
+    const minLength = Number.parseInt(form.dataset.minPasswordLength, 10) || E2E_MIN_PASSWORD_LENGTH;
+    const show = (el, message) => { el.textContent = message; el.classList.toggle('is-hidden', !message); };
+
+    form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        show(errorEl, ''); show(successEl, '');
+        const current = document.getElementById('current-password').value;
+        const next = document.getElementById('new-password').value;
+        if (!current) { show(errorEl, 'Enter your current password.'); return; }
+        if (next.length < minLength) { show(errorEl, `The new password needs at least ${minLength} characters.`); return; }
+        if (next !== document.getElementById('new-password-confirm').value) { show(errorEl, 'The new passwords do not match.'); return; }
+        if (next === current) { show(errorEl, 'The new password must be different.'); return; }
+
+        submit.disabled = true;
+        try {
+            submit.textContent = 'Checking…';
+            const oldKeys = await e2e.deriveAccountKeys(username, current);
+            const wrapped = await e2e.loadWrappedPrivateKeyFromServer();
+            let pkcs8;
+            try {
+                pkcs8 = await e2e.unwrapPkcs8(wrapped, oldKeys.wrapKeyB64);
+            } catch {
+                show(errorEl, 'Current password is wrong.');
+                return;
+            }
+            submit.textContent = 'Re-encrypting key…';
+            const newKeys = await e2e.deriveAccountKeys(username, next);
+            const { res, data } = await e2ePostJson('/api/account/password', {
+                current_auth_key: oldKeys.authKeyHex,
+                new_auth_key: newKeys.authKeyHex,
+                wrapped_private_key: await e2e.wrapPkcs8(pkcs8, newKeys.wrapKeyB64),
+            });
+            if (!res.ok) { show(errorEl, data.error || `Failed (${res.status})`); return; }
+            e2e.saveSessionWrapKey(newKeys.wrapKeyB64);
+            let message = `Password changed. ${data.signed_out} other device(s) were signed out.`;
+            if (deviceUnlock.isEnrolled(username)) {
+                // The stored fingerprint data holds the old password's keys.
+                deviceUnlock.remove(username);
+                message += ' Fingerprint unlock on this device was turned off; enable it again below.';
+            }
+            form.reset();
+            show(successEl, message);
+            setTimeout(() => location.reload(), 2500);
+        } catch (err) {
+            show(errorEl, `Could not change the password: ${err.message}`);
+        } finally {
+            submit.disabled = false;
+            submit.textContent = 'Change password';
+        }
+    });
+})();
+
+// ── Fingerprint unlock setup ────────────────────────────────────────────
+(async () => {
+    const username = document.body.dataset.userUsername;
+    const statusEl = document.getElementById('device-status');
+    const enableBox = document.getElementById('device-enable');
+    const passwordEl = document.getElementById('device-password');
+    const enableBtn = document.getElementById('device-enable-btn');
+    const removeBtn = document.getElementById('device-remove-btn');
+    const errorEl = document.getElementById('device-error');
+
+    function showError(message) {
+        errorEl.textContent = message;
+        errorEl.classList.toggle('is-hidden', !message);
+    }
+
+    async function render() {
+        const enrolled = deviceUnlock.isEnrolled(username);
+        removeBtn.classList.toggle('is-hidden', !enrolled);
+        enableBox.classList.add('is-hidden');
+        if (enrolled) {
+            statusEl.textContent = '✅ Enabled on this device.';
+            return;
+        }
+        const reason = await deviceUnlock.unsupportedReason();
+        if (reason) {
+            statusEl.textContent = `Not available: ${reason}`;
+            return;
+        }
+        statusEl.textContent = 'Not enabled on this device.';
+        enableBox.classList.remove('is-hidden');
+    }
+
+    async function enable() {
+        showError('');
+        const password = passwordEl.value;
+        if (!password) { showError('Enter your password to confirm.'); return; }
+        enableBtn.disabled = true;
+        try {
+            enableBtn.textContent = 'Checking…';
+            const { authKeyHex, wrapKeyB64 } = await e2e.deriveAccountKeys(username, password);
+            // Proves the password without a server login: only the right wrap key
+            // can decrypt the private-key backup (AES-GCM is authenticated).
+            const wrapped = await e2e.loadWrappedPrivateKeyFromServer();
+            try {
+                await e2e.unwrapPrivateKey(wrapped, wrapKeyB64);
+            } catch {
+                showError('Wrong password.');
+                return;
+            }
+            enableBtn.textContent = 'Touch the sensor…';
+            await deviceUnlock.enroll(username, authKeyHex, wrapKeyB64);
+            passwordEl.value = '';
+        } catch (err) {
+            showError(err.name === 'NotAllowedError'
+                ? 'Cancelled.'
+                : `Could not enable fingerprint unlock: ${err.message}`);
+        } finally {
+            enableBtn.disabled = false;
+            enableBtn.textContent = 'Enable';
+            await render();
+        }
+    }
+
+    enableBtn.addEventListener('click', enable);
+    passwordEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') enable(); });
+    removeBtn.addEventListener('click', async () => {
+        if (!window.confirm('Remove fingerprint unlock from this device? You will need your password again.')) return;
+        deviceUnlock.remove(username);
+        showError('');
+        await render();
+    });
+    await render();
+})();
+
+(async () => {
+    // Fingerprints are computed HERE, in the browser, from the raw public keys —
+    // not by the server — so the server cannot simply display a fake fingerprint.
+    const targets = document.querySelectorAll('#my-fingerprint, .js-fingerprint');
+    for (const el of targets) {
+        try {
+            el.textContent = await e2e.fingerprint(el.dataset.publicKey);
+        } catch {
+            el.textContent = 'Invalid key';
+        }
+    }
+})();
+</script>
+{% endblock %}

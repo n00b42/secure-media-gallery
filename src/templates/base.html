@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>{% block title %}Secure Media Gallery{% endblock %}</title>
+    <script nonce="{{ csp_nonce }}">
+    // Apply the colour theme before the first paint (no light flash in dark mode).
+    // Choice: localStorage "theme" = auto (follow the system) | light | dark.
+    (() => {
+      const media = window.matchMedia('(prefers-color-scheme: dark)');
+      const apply = () => {
+        const choice = localStorage.getItem('theme') || 'auto';
+        const dark = choice === 'dark' || (choice === 'auto' && media.matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        document.documentElement.dataset.themeChoice = choice;
+        const meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.content = dark ? '#121316' : '#0f766e';
+      };
+      apply();
+      media.addEventListener('change', apply);
+      window.__applyTheme = apply;
+    })();
+    </script>
+    <meta name="theme-color" content="#0f766e">
+    <link rel="manifest" href="{{ url_for('gallery.web_manifest') }}">
+    <link rel="icon" type="image/svg+xml" href="{{ asset_url('favicon-lock.svg') }}">
+    <link rel="apple-touch-icon" href="{{ asset_url('icons/apple-touch-icon.png') }}">
+    <meta name="apple-mobile-web-app-title" content="Gallery">
+    <meta name="mobile-web-app-capable" content="yes">
+    <link rel="stylesheet" href="{{ asset_url('css/fonts.css') }}">
+    <link rel="stylesheet" href="{{ asset_url('css/app.css') }}">
+    {% block extra_css %}{% endblock %}
+</head>
+<body
+  data-user-id="{% if current_user.is_authenticated %}{{ current_user.id }}{% endif %}"
+  data-user-username="{% if current_user.is_authenticated %}{{ current_user.username|e }}{% endif %}"
+>
+<div class="container">
+    <header>
+        <h1>🔒 Secure Media Gallery</h1>
+        <nav>
+            {% if current_user.is_authenticated %}
+                <span>Welcome, {{ current_user.username }}!</span>
+                <a href="{{ url_for('gallery.dashboard') }}">Dashboard</a>
+                <a href="{{ url_for('gallery.account') }}">Account</a>
+                <form id="logout-form" method="POST" action="{{ url_for('auth.logout') }}" class="nav-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="nav-button">Logout</button>
+                </form>
+                <span id="e2e-status" class="loading">⏳ Setting up E2E…</span>
+            {% else %}
+                <a href="{{ url_for('auth.login') }}">Login</a>
+                <a href="{{ url_for('auth.register') }}">Register</a>
+            {% endif %}
+            <button type="button" id="theme-toggle" class="theme-toggle" aria-label="Colour theme">🌓</button>
+        </nav>
+    </header>
+
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+</div>
+
+<!-- Password prompt modal for unlocking the private key -->
+<div id="key-modal-overlay">
+    <div id="key-modal">
+        <h3 id="key-modal-title">🔑 Unlock Encryption</h3>
+        <p id="key-modal-desc">
+            Enter your password to unlock your private encryption key.
+        </p>
+        <button type="button" id="key-modal-device" class="btn device-unlock-btn is-hidden">👆 Use fingerprint</button>
+        <input type="password" id="key-modal-password" placeholder="Your password" autocomplete="current-password">
+        <div id="key-modal-error"></div>
+        <div class="modal-actions">
+            <button id="key-modal-submit" class="btn">Unlock</button>
+          <button id="key-modal-regen" class="btn btn-secondary">Reset Keys</button>
+        </div>
+    </div>
+</div>
+
+<script nonce="{{ csp_nonce }}" src="{{ asset_url('vendor/hash-wasm/argon2.umd.min.js') }}"></script>
+<script nonce="{{ csp_nonce }}" src="{{ asset_url('js/chunked-file.js') }}"></script>
+<script nonce="{{ csp_nonce }}" src="{{ asset_url('js/e2e-encryption.js') }}"></script>
+<script nonce="{{ csp_nonce }}">
+// Theme switcher: cycles auto → light → dark (see the script in <head>).
+(() => {
+  const button = document.getElementById('theme-toggle');
+  const icons = { auto: '🌓', light: '☀️', dark: '🌙' };
+  const labels = { auto: 'Theme: automatic (follows the system)', light: 'Theme: light', dark: 'Theme: dark' };
+  const render = () => {
+    const choice = document.documentElement.dataset.themeChoice || 'auto';
+    button.textContent = icons[choice];
+    button.title = labels[choice];
+  };
+  button.addEventListener('click', () => {
+    const order = ['auto', 'light', 'dark'];
+    const current = document.documentElement.dataset.themeChoice || 'auto';
+    localStorage.setItem('theme', order[(order.indexOf(current) + 1) % order.length]);
+    window.__applyTheme();
+    render();
+  });
+  render();
+})();
+
+// Installable app (PWA): the service worker only caches versioned static files.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register({{ url_for('gallery.service_worker') | tojson }}).catch(() => {});
+}
+
+// Confirmation for destructive forms: <form data-confirm="Really?">.
+// (Replaces inline submit-handler attributes, which the CSP blocks — and which were
+// an XSS vector when user-controlled names were interpolated into them.)
+document.addEventListener('submit', (event) => {
+  const message = event.target.dataset ? event.target.dataset.confirm : null;
+  if (message && !window.confirm(message)) event.preventDefault();
+});
+</script>
+{% if current_user.is_authenticated %}
+<script nonce="{{ csp_nonce }}">
+// ─────────────────────────────────────────────────────────────────────────────
+// Global E2E key bootstrap — runs on every authenticated page load.
+//
+// The server holds the user's private key ONLY as ciphertext, wrapped with a
+// key derived from the login password in the browser (see e2e-encryption.js).
+//
+// A wrap key is only ever trusted if it was verified:
+//   • by the server at login (login page stores it in sessionStorage), or
+//   • by successfully decrypting the backup (AES-GCM authenticates it).
+// That way a mistyped password can never re-wrap the backup with a wrong key.
+//
+// The unlocked (non-extractable) CryptoKey is kept in window.__e2ePrivateKey.
+// ─────────────────────────────────────────────────────────────────────────────
+
+(async () => {
+  const USER_USERNAME = document.body.dataset.userUsername || '';
+  const statusEl      = document.getElementById('e2e-status');
+  const modalOverlay  = document.getElementById('key-modal-overlay');
+  const modalTitle    = document.getElementById('key-modal-title');
+  const modalDesc     = document.getElementById('key-modal-desc');
+  const modalPw       = document.getElementById('key-modal-password');
+  const modalErr      = document.getElementById('key-modal-error');
+  const modalSubmit   = document.getElementById('key-modal-submit');
+  const modalRegen    = document.getElementById('key-modal-regen');
+  const modalDevice   = document.getElementById('key-modal-device');
+  const RESET = Symbol('reset');
+
+  window.__e2eReady = false;
+  window.__e2ePrivateKey = null;
+
+  if (!USER_USERNAME) {
+    console.error('Missing authenticated user metadata for E2E bootstrap.');
+    return;
+  }
+
+  function setStatus(state, text) {
+    statusEl.className = state;
+    statusEl.textContent = text;
+  }
+
+  function finish(privateKey) {
+    window.__e2ePrivateKey = privateKey;
+    window.__e2eReady = true;
+    if (privateKey) setStatus('ready', '🔐 Ready');
+    window.dispatchEvent(new Event('e2e-ready'));
+  }
+
+  // ── Password modal. Resolves with the password, null if "Reset Keys", or
+  //    { wrapKeyB64 } after a successful fingerprint unlock (if offered). ──
+  function promptForPassword(title, desc, { showRegen = false, error = '', offerDevice = false } = {}) {
+    return new Promise((resolve) => {
+      modalTitle.textContent = title;
+      modalDesc.textContent  = desc;
+      modalPw.value          = '';
+      modalErr.textContent   = error;
+      modalErr.style.display = error ? 'block' : 'none';
+      modalRegen.style.display = showRegen ? '' : 'none';
+      modalDevice.classList.toggle('is-hidden', !offerDevice);
+      modalOverlay.classList.add('active');
+      (offerDevice ? modalDevice : modalPw).focus();
+
+      function done(value) {
+        modalOverlay.classList.remove('active');
+        modalSubmit.removeEventListener('click', onSubmit);
+        modalRegen.removeEventListener('click', onRegen);
+        modalDevice.removeEventListener('click', onDevice);
+        modalPw.removeEventListener('keydown', onKeydown);
+        modalPw.value = '';
+        resolve(value);
+      }
+      async function onDevice() {
+        modalDevice.disabled = true;
+        try {
+          const { wrapKeyB64 } = await deviceUnlock.unlock(USER_USERNAME);
+          done({ wrapKeyB64 });
+        } catch (err) {
+          modalErr.textContent = err.name === 'NotAllowedError'
+            ? 'Fingerprint check cancelled. Try again or enter your password.'
+            : `Fingerprint unlock failed: ${err.message}`;
+          modalErr.style.display = 'block';
+        } finally {
+          modalDevice.disabled = false;
+        }
+      }
+      function onSubmit() {
+        if (!modalPw.value) {
+          modalErr.textContent = 'Password cannot be empty.';
+          modalErr.style.display = 'block';
+          return;
+        }
+        done(modalPw.value);
+      }
+      function onRegen() { done(null); }
+      function onKeydown(e) { if (e.key === 'Enter') onSubmit(); }
+
+      modalSubmit.addEventListener('click', onSubmit);
+      modalRegen.addEventListener('click', onRegen);
+      modalDevice.addEventListener('click', onDevice);
+      modalPw.addEventListener('keydown', onKeydown);
+    });
+  }
+
+  function needRelogin(reason) {
+    setStatus('error', '⚠️ Log in again to unlock encryption');
+    statusEl.title = reason;
+    statusEl.onclick = () => { document.getElementById('logout-form').submit(); };
+    finish(null);
+  }
+
+  // Generating new keys makes every file encrypted for the OLD key unreadable
+  // for this user. Only offered when the old key genuinely cannot be recovered.
+  async function offerReset(reason) {
+    const wrapKeyB64 = e2e.loadSessionWrapKey();
+    if (!wrapKeyB64) return null;
+    const ok = window.confirm(
+      `${reason}\n\nGenerate NEW encryption keys?\n\n` +
+      'WARNING: every file you uploaded or that was shared with you so far will become ' +
+      'permanently UNREADABLE for you. Album owners would have to share them with you again. ' +
+      'This cannot be undone.'
+    );
+    if (!ok) return null;
+    setStatus('loading', '⏳ Generating keys…');
+    return e2e.setupKeys(wrapKeyB64);
+  }
+
+  // ── Unwrap the backup with the session wrap key, or ask for the password ──
+  async function unlockPrivateKey(wrapped) {
+    const sessionKey = e2e.loadSessionWrapKey();
+    if (sessionKey) {
+      try {
+        return await e2e.unwrapPrivateKey(wrapped, sessionKey);
+      } catch {
+        // The login password was verified by the server, so the backup itself is unusable.
+        return RESET;
+      }
+    }
+
+    let error = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const offerDevice = deviceUnlock.isEnrolled(USER_USERNAME);
+      const answer = await promptForPassword(
+        '🔑 Unlock your encryption',
+        offerDevice
+          ? 'Use your fingerprint, or enter your login password, to unlock your private key.'
+          : 'Enter your login password to unlock your private key in this tab.',
+        { error, offerDevice },
+      );
+      const viaDevice = typeof answer === 'object' && answer !== null;
+      setStatus('loading', '⏳ Unlocking…');
+      const { wrapKeyB64 } = viaDevice ? answer : await e2e.deriveAccountKeys(USER_USERNAME, answer);
+      try {
+        const key = await e2e.unwrapPrivateKey(wrapped, wrapKeyB64);
+        e2e.saveSessionWrapKey(wrapKeyB64);
+        return key;
+      } catch {
+        if (viaDevice) {
+          // Saved keys no longer match the account (e.g. it was recreated).
+          deviceUnlock.remove(USER_USERNAME);
+          error = 'Fingerprint unlock was out of date and has been removed. Enter your password.';
+          attempt--; // not a wrong password
+        } else {
+          error = 'Wrong password. Try again.';
+        }
+        setStatus('error', '⚠️ Could not unlock');
+      }
+    }
+    throw new Error('Too many failed attempts');
+  }
+
+  try {
+    const contextError = e2eSecureContextError();
+    if (contextError) {
+      setStatus('error', '⚠️ Needs HTTPS');
+      statusEl.title = contextError;
+      finish(null);
+      return;
+    }
+
+    const meta = await fetch('/api/keys/me').then(r => r.json());
+
+    if (!meta.has_key) {
+      // e.g. accounts created with manage.py: create the key pair now.
+      const wrapKeyB64 = e2e.loadSessionWrapKey();
+      if (!wrapKeyB64) return needRelogin('Your encryption keys are created right after login.');
+      setStatus('loading', '⏳ Generating keys…');
+      finish(await e2e.setupKeys(wrapKeyB64));
+      return;
+    }
+
+    const wrapped = meta.has_wrapped_private_key ? await e2e.loadWrappedPrivateKeyFromServer() : null;
+    let privateKey = wrapped ? await unlockPrivateKey(wrapped) : RESET;
+    if (privateKey === RESET) {
+      privateKey = await offerReset('Your private key backup could not be decrypted.');
+      if (!privateKey) {
+        setStatus('error', '⚠️ Private key unavailable');
+        finish(null);
+        return;
+      }
+    }
+
+    finish(privateKey);
+
+  } catch (err) {
+    console.error('E2E key setup failed:', err);
+    setStatus('error', '⚠️ E2E Error — click to retry');
+    statusEl.onclick = () => location.reload();
+  }
+})();
+</script>
+{% else %}
+<script nonce="{{ csp_nonce }}">e2e.clearSessionSecrets();</script>
+{% endif %}
+
+{% block extra_js %}{% endblock %}
+</body>
+</html>

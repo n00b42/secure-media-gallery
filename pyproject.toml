@@ -1,0 +1,74 @@
+[tool.poetry]
+name = "secure-media-gallery"
+version = "1.0.0"
+description = "A privacy-focused web application for securely storing and sharing pictures and videos with end-to-end encryption"
+authors = ["n00b42 <6792900+n00b42@users.noreply.github.com>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/n00b42/secure-media-gallery"
+repository = "https://github.com/n00b42/secure-media-gallery"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<4.0"
+Flask = "^3.1"
+Flask-SQLAlchemy = "^3.1"
+Flask-Login = "^0.6.3"
+Flask-WTF = "^1.2"      # not used yet: intended for CSRF tokens on HTML forms
+WTForms = "^3.2"
+cryptography = "^50.0.2"
+python-dotenv = "^1.2"
+gunicorn = "^27.0"
+argon2-cffi = "^25.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0"
+pytest-cov = "^7.0"
+ruff = "*"
+mypy = "^2.0"
+
+# All tool caches live outside the project (it sits in a synced folder).
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+cache-dir = "~/.cache/ruff"
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, import sorting, bugbear, pyupgrade
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = ["E501"]  # line length is handled by `ruff format`
+
+[tool.ruff.lint.per-file-ignores]
+# These set up sys.path / environment variables before importing the app.
+"src/manage.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# .pytest_cache would land in the project; disable it (pytest's --lf/--ff need it)
+addopts = "-p no:cacheprovider"
+
+[tool.coverage.run]
+# Opt in with:  poetry run pytest --cov
+source = ["src"]
+data_file = "${HOME}/.cache/secure-media-gallery/coverage"
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.mypy]
+python_version = "3.12"
+cache_dir = "~/.cache/mypy/secure-media-gallery"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

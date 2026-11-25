@@ -1,0 +1,4 @@
+hash-wasm 4.13.0 (MIT), https://www.npmjs.com/package/hash-wasm
+File: dist/argon2.umd.min.js from the npm tarball
+Tarball integrity: sha512-GrWl7wsV46fKIXQZB5ebskLZLAmKL6d9RS0fspCxDeQyjoNu1AfTJTMLPOJyfzaQm0ldFiwFN21/w+sE/kgEFQ==
+sha256(argon2.umd.min.js): acfe11b015852f593aaddc51116f71dc7850e4551e6b34d42c1f88cf39635f03

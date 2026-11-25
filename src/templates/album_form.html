@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}{{ 'Edit Album' if album else 'Create Album' }} - Secure Media Gallery{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ asset_url('css/pages/album_form.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="form-container">
+    <h2>{{ 'Edit Album' if album else 'Create New Album' }}</h2>
+    <form method="POST" class="form-centered">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="form-group">
+            <label for="title">Album Title *</label>
+            <input type="text" id="title" name="title" required maxlength="{{ max_title }}"
+                   value="{{ form_title }}">
+        </div>
+        <div class="form-group">
+            <label for="description">Description</label>
+            <textarea id="description" name="description" maxlength="{{ max_description }}"
+                      placeholder="Add a description for your album...">{{ form_description }}</textarea>
+        </div>
+        <div class="form-actions">
+            <button type="submit">{{ 'Save' if album else 'Create Album' }}</button>
+            <a href="{{ url_for('gallery.view_album', album_id=album.id) if album else url_for('gallery.dashboard') }}"
+               class="btn btn-secondary">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}

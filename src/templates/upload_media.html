@@ -1,0 +1,557 @@
+{% extends "base.html" %}
+
+{% block title %}Upload Media - Secure Media Gallery{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ asset_url('css/pages/upload_media.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="upload-container">
+    <h2>Upload to "{{ album.title }}"</h2>
+
+    <div id="e2e-warning" class="alert warning">
+        ⏳ Waiting for encryption keys to be ready…
+    </div>
+
+    <div id="resume-section" class="resume-section is-hidden">
+        <h3>Unfinished uploads</h3>
+        <p class="info-text">Select the same file again to continue where it stopped, or discard it.</p>
+        <div id="resume-items"></div>
+    </div>
+
+    <div class="upload-area" id="uploadArea">
+        <div class="upload-icon">📁</div>
+        <p><strong>Drag and drop files here</strong></p>
+        <p>or</p>
+        <button type="button" class="btn" id="browseBtn">Click to browse</button>
+        <input type="file" id="fileInput" multiple accept="image/*,video/*">
+    </div>
+
+    <p class="info-text">
+        ✓ Supported: JPG, PNG, GIF, BMP, WebP, MP4, AVI, MOV, MKV, WebM<br>
+        ✓ Large files are uploaded in encrypted 4 MB pieces and can be resumed if interrupted<br>
+        <span id="storage-line"></span>
+        🔐 Files are encrypted <em>in your browser</em> — the server never sees originals
+    </p>
+
+    <div class="file-list" id="fileList">
+        <h3>Files to upload:</h3>
+        <div id="fileItems"></div>
+    </div>
+
+    <div id="progress-bar-wrap"><div id="progress-bar"></div></div>
+    <div id="progress-label"></div>
+
+    <div class="form-actions">
+        <button id="uploadBtn" class="btn" disabled>Encrypt &amp; Upload</button>
+        <button type="button" id="stopBtn" class="btn btn-secondary is-hidden">Stop</button>
+        <a href="{{ url_for('gallery.view_album', album_id=album.id) }}" id="backBtn" class="btn btn-secondary">Back to album</a>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ csp_nonce }}">
+(async () => {
+    const ALBUM_ID    = {{ album.id | tojson }};
+    const ALBUM_URL   = {{ url_for('gallery.view_album', album_id=album.id) | tojson }};
+    const RECIPIENTS  = {{ upload_recipients | tojson }};
+    let   STORAGE     = {{ storage | tojson }};
+    const uploadArea  = document.getElementById('uploadArea');
+    const browseBtn   = document.getElementById('browseBtn');
+    const fileInput   = document.getElementById('fileInput');
+    const fileList    = document.getElementById('fileList');
+    const fileItems   = document.getElementById('fileItems');
+    const uploadBtn   = document.getElementById('uploadBtn');
+    const stopBtn     = document.getElementById('stopBtn');
+    const warning     = document.getElementById('e2e-warning');
+    const progressWrap= document.getElementById('progress-bar-wrap');
+    const progressBar = document.getElementById('progress-bar');
+    const progressLbl = document.getElementById('progress-label');
+    const resumeBox   = document.getElementById('resume-section');
+    const resumeItems = document.getElementById('resume-items');
+    const storageLine = document.getElementById('storage-line');
+
+    let selectedFiles = [];
+    let uploading = false;
+    let abortController = null;
+    let pendingUploads = [];
+    const fileState = new Map(); // File -> { status, sent, total, state: pending|active|done|error }
+    const mediaInfoByFile = new WeakMap();
+    const mediaInfoInFlight = new WeakSet();
+
+    function escapeHtml(value) {
+        return String(value || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatDuration(seconds) {
+        if (!Number.isFinite(seconds) || seconds <= 0) return 'Unknown';
+        const rounded = Math.round(seconds);
+        const h = Math.floor(rounded / 3600);
+        const m = Math.floor((rounded % 3600) / 60);
+        const s = rounded % 60;
+        if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        return `${m}:${String(s).padStart(2, '0')}`;
+    }
+
+    function parseCodecFromMime(mime) {
+        const match = /codecs?="?([^";]+)"?/i.exec(String(mime || ''));
+        return match ? match[1].trim() : '';
+    }
+
+    function getFileExtension(filename) {
+        const parts = String(filename || '').split('.');
+        return parts.length > 1 ? parts.pop().toLowerCase() : '';
+    }
+
+    function waitForEvent(target, eventName, timeoutMs = 4000) {
+        return new Promise((resolve, reject) => {
+            const onEvent = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+            const onError = () => {
+                clearTimeout(timer);
+                reject(new Error(`Event failed: ${eventName}`));
+            };
+            const timer = setTimeout(() => {
+                target.removeEventListener(eventName, onEvent);
+                target.removeEventListener('error', onError);
+                reject(new Error(`Event timeout: ${eventName}`));
+            }, timeoutMs);
+
+            target.addEventListener(eventName, onEvent, { once: true });
+            target.addEventListener('error', onError, { once: true });
+        });
+    }
+
+    async function inspectSelectedFile(file) {
+        const mime = String(file.type || 'application/octet-stream');
+        const ext = getFileExtension(file.name);
+        const codec = parseCodecFromMime(mime);
+        const info = {
+            mime,
+            container: ext ? ext.toUpperCase() : 'Unknown',
+            codec: codec || 'Not exposed by browser',
+            resolution: 'Unknown',
+            duration: 'n/a',
+        };
+
+        if (mime.startsWith('image/')) {
+            const objectUrl = URL.createObjectURL(file);
+            const img = new Image();
+            img.src = objectUrl;
+            try {
+                await waitForEvent(img, 'load', 3500);
+                info.resolution = `${img.naturalWidth || 0}x${img.naturalHeight || 0}`;
+            } finally {
+                URL.revokeObjectURL(objectUrl);
+            }
+            return info;
+        }
+
+        if (mime.startsWith('video/')) {
+            const objectUrl = URL.createObjectURL(file);
+            const video = document.createElement('video');
+            video.src = objectUrl;
+            video.preload = 'metadata';
+
+            try {
+                await waitForEvent(video, 'loadedmetadata', 4500);
+                info.duration = formatDuration(video.duration);
+                const width = Number(video.videoWidth || 0);
+                const height = Number(video.videoHeight || 0);
+                info.resolution = width > 0 && height > 0 ? `${width}x${height}` : 'Unknown';
+            } finally {
+                video.pause();
+                video.removeAttribute('src');
+                video.load();
+                URL.revokeObjectURL(objectUrl);
+            }
+            return info;
+        }
+
+        return info;
+    }
+
+    function enrichMediaInfo() {
+        for (const file of selectedFiles) {
+            if (mediaInfoByFile.has(file) || mediaInfoInFlight.has(file)) continue;
+
+            mediaInfoInFlight.add(file);
+            inspectSelectedFile(file)
+                .then(info => {
+                    mediaInfoByFile.set(file, info);
+                })
+                .catch(() => {
+                    mediaInfoByFile.set(file, {
+                        mime: String(file.type || 'application/octet-stream'),
+                        container: getFileExtension(file.name).toUpperCase() || 'Unknown',
+                        codec: 'Not exposed by browser',
+                        resolution: 'Unknown',
+                        duration: 'Unknown',
+                    });
+                })
+                .finally(() => {
+                    mediaInfoInFlight.delete(file);
+                    renderFileList();
+                });
+        }
+    }
+
+    // Only "image" or "video" is revealed to the server (it needs it to render the grid).
+    function mediaFileType(file) {
+        const mime = String(file.type || '');
+        if (mime.startsWith('video/')) return 'video';
+        if (mime.startsWith('image/')) return 'image';
+        return ['mp4', 'avi', 'mov', 'mkv', 'webm'].includes(getFileExtension(file.name)) ? 'video' : 'image';
+    }
+
+    function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes < 0) return '?';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let value = bytes;
+        let unit = 0;
+        while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+        return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+    }
+
+    function renderStorage() {
+        const parts = [];
+        if (STORAGE.quota) {
+            const whose = STORAGE.own_album ? 'Storage' : "Album owner's storage";
+            parts.push(`✓ ${whose}: ${formatBytes(STORAGE.used)} of ${formatBytes(STORAGE.quota)} used`);
+        }
+        if (STORAGE.max_file_size) parts.push(`✓ Max file size: ${formatBytes(STORAGE.max_file_size)}`);
+        storageLine.innerHTML = parts.map(escapeHtml).join('<br>') + (parts.length ? '<br>' : '');
+    }
+    renderStorage();
+
+    // ── Wait for E2E keys ──────────────────────────────────────────────────
+    function waitForE2E() {
+        return new Promise(resolve => {
+            if (window.__e2eReady) { resolve(); return; }
+            warning.style.display = '';
+            window.addEventListener('e2e-ready', () => { warning.style.display = 'none'; resolve(); }, { once: true });
+        });
+    }
+
+    async function getRecipientPublicKeys() {
+        if (!RECIPIENTS.length) throw new Error('No upload recipients with registered keys found');
+
+        const recipients = [];
+        for (const recipient of RECIPIENTS) {
+            try {
+                const importedKey = await e2e.importPublicKey(recipient.public_key);
+                recipients.push({ id: recipient.id, publicKey: importedKey });
+            } catch (err) {
+                console.warn(`Skipping recipient ${recipient.username}:`, err);
+            }
+        }
+
+        if (!recipients.length) throw new Error('Could not import recipient public keys');
+        return recipients;
+    }
+
+    // ── Unfinished uploads (resumable) ─────────────────────────────────────
+    async function loadPending() {
+        const privateKey = window.__e2ePrivateKey;
+        if (!privateKey) return;
+        try {
+            const data = await new E2EUploader(ALBUM_ID, []).pending(privateKey);
+            pendingUploads = data.uploads;
+            STORAGE = { used: data.used, quota: data.quota, max_file_size: data.max_file_size, own_album: data.own_album };
+            renderStorage();
+        } catch (err) {
+            console.warn(err);
+            pendingUploads = [];
+        }
+        renderPending();
+    }
+
+    function renderPending() {
+        resumeItems.replaceChildren();
+        for (const upload of pendingUploads) {
+            const row = document.createElement('div');
+            row.className = 'file-item';
+            const percent = Math.floor((upload.received / upload.total_size) * 100);
+            row.innerHTML = `
+                <div class="file-item-main">
+                    <span class="file-item-name">${escapeHtml(upload.filename)}</span>
+                    <div class="file-item-meta">${percent}% of ${escapeHtml(formatBytes(upload.total_size))} uploaded</div>
+                </div>`;
+            const discard = document.createElement('button');
+            discard.type = 'button';
+            discard.className = 'btn btn-danger btn-sm';
+            discard.textContent = 'Discard';
+            discard.disabled = uploading;
+            discard.addEventListener('click', async () => {
+                if (!window.confirm(`Discard the unfinished upload of "${upload.filename}"?`)) return;
+                await E2EUploader.discard(upload.token);
+                await loadPending();
+            });
+            row.appendChild(discard);
+            resumeItems.appendChild(row);
+        }
+        resumeBox.classList.toggle('is-hidden', pendingUploads.length === 0);
+    }
+
+    // ── File list UI ───────────────────────────────────────────────────────
+    function renderFileList() {
+        fileItems.innerHTML = '';
+        if (!selectedFiles.length) {
+            fileList.classList.remove('show');
+            uploadBtn.disabled = true;
+            return;
+        }
+        fileList.classList.add('show');
+        uploadBtn.disabled = uploading;
+
+        selectedFiles.forEach((f, i) => {
+            const info = mediaInfoByFile.get(f);
+            const state = fileState.get(f) || { status: 'Ready', sent: 0, total: 0, state: 'pending' };
+            const infoText = info
+                ? `${escapeHtml(info.container)} • ${escapeHtml(info.resolution)} • ${escapeHtml(info.duration)}`
+                : 'Inspecting media metadata…';
+            const percent = state.total ? Math.floor((state.sent / state.total) * 100) : 0;
+
+            const div = document.createElement('div');
+            div.className = `file-item file-item-${state.state}`;
+            div.innerHTML = `
+                <div class="file-item-main">
+                    <span class="file-item-name">${escapeHtml(f.name)}</span>
+                    <div class="file-item-meta">${infoText}</div>
+                    <div class="file-progress"><div class="file-progress-bar"></div></div>
+                </div>
+                <span class="file-item-size">${escapeHtml(formatBytes(f.size))}</span>
+                <span class="file-item-status">${escapeHtml(state.status)}</span>
+                ${uploading ? '' : `<button type="button" class="remove-file" data-index="${i}" aria-label="Remove file">✕</button>`}
+            `;
+            // Set via the style property: inline style attributes are blocked by the CSP.
+            div.querySelector('.file-progress-bar').style.width = `${percent}%`;
+            fileItems.appendChild(div);
+        });
+
+        enrichMediaInfo();
+    }
+
+    function setFileState(file, patch) {
+        fileState.set(file, { ...(fileState.get(file) || { status: '', sent: 0, total: 0, state: 'pending' }), ...patch });
+        renderFileList();
+    }
+
+    fileItems.addEventListener('click', (event) => {
+        const button = event.target.closest('.remove-file');
+        if (!button || uploading) return;
+        selectedFiles.splice(Number.parseInt(button.dataset.index, 10), 1);
+        renderFileList();
+    });
+
+    // ── Drag & drop / browse ───────────────────────────────────────────────
+    function selectFiles(files) {
+        if (uploading) return;
+        selectedFiles = Array.from(files);
+        fileState.clear();
+        renderFileList();
+    }
+    browseBtn.addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
+    uploadArea.addEventListener('click', () => { if (!uploading) fileInput.click(); });
+    uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+    uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+    uploadArea.addEventListener('drop', e => {
+        e.preventDefault();
+        uploadArea.classList.remove('dragover');
+        selectFiles(e.dataTransfer.files);
+    });
+    fileInput.addEventListener('change', () => selectFiles(fileInput.files));
+
+    // ── Upload flow ────────────────────────────────────────────────────────
+    function buildFallbackVideoThumbnailDataUrl(filename) {
+        const label = String(filename || 'VID').trim().slice(0, 3).toUpperCase() || 'VID';
+        const svg = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+                <defs>
+                    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+                        <stop offset="0%" stop-color="#1f2937"/>
+                        <stop offset="100%" stop-color="#0f172a"/>
+                    </linearGradient>
+                </defs>
+                <rect width="640" height="360" rx="20" fill="url(#g)"/>
+                <circle cx="320" cy="172" r="62" fill="rgba(255,255,255,0.14)"/>
+                <polygon points="300,134 300,210 360,172" fill="#ffffff"/>
+                <text x="320" y="304" text-anchor="middle" fill="#e5e7eb" font-size="46" font-family="Arial, sans-serif" font-weight="700">${label}</text>
+            </svg>
+        `;
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+    }
+
+    async function generateVideoThumbnailDataUrl(file) {
+        if (!file || !String(file.type || '').startsWith('video/')) return '';
+
+        const fallbackThumbnail = buildFallbackVideoThumbnailDataUrl(file.name);
+
+        const objectUrl = URL.createObjectURL(file);
+        const video = document.createElement('video');
+        video.src = objectUrl;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'metadata';
+
+        const waitForEvent = (eventName, timeoutMs = 3500) => new Promise((resolve, reject) => {
+            const onEvent = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+            const onError = () => {
+                clearTimeout(timer);
+                reject(new Error(`Thumbnail generation failed at ${eventName}`));
+            };
+            const timer = setTimeout(() => {
+                video.removeEventListener(eventName, onEvent);
+                video.removeEventListener('error', onError);
+                reject(new Error(`Thumbnail timeout at ${eventName}`));
+            }, timeoutMs);
+
+            video.addEventListener(eventName, onEvent, { once: true });
+            video.addEventListener('error', onError, { once: true });
+        });
+
+        try {
+            await waitForEvent('loadedmetadata');
+
+            const duration = Number.isFinite(video.duration) ? video.duration : 0;
+            if (duration > 0.2) {
+                video.currentTime = Math.min(0.2, duration * 0.05);
+                await waitForEvent('seeked', 2000);
+            } else {
+                await waitForEvent('loadeddata', 2000);
+            }
+
+            const sourceWidth = video.videoWidth || 320;
+            const sourceHeight = video.videoHeight || 180;
+            const maxSide = 480;
+            const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+            const width = Math.max(1, Math.round(sourceWidth * scale));
+            const height = Math.max(1, Math.round(sourceHeight * scale));
+
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return fallbackThumbnail;
+            ctx.drawImage(video, 0, 0, width, height);
+            return canvas.toDataURL('image/jpeg', 0.78);
+        } catch {
+            return fallbackThumbnail;
+        } finally {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+            URL.revokeObjectURL(objectUrl);
+        }
+    }
+
+    stopBtn.addEventListener('click', () => {
+        if (abortController) abortController.abort();
+    });
+
+    uploadBtn.addEventListener('click', async () => {
+        if (!selectedFiles.length || uploading) return;
+
+        await waitForE2E();
+        const privateKey = window.__e2ePrivateKey;
+        if (!privateKey) { alert('Encryption keys not ready. Please refresh.'); return; }
+
+        let recipients;
+        try { recipients = await getRecipientPublicKeys(); }
+        catch (err) { alert('Could not load album recipient keys: ' + err.message); return; }
+
+        const tooLarge = STORAGE.max_file_size && selectedFiles.find(f => f.size > STORAGE.max_file_size);
+        if (tooLarge) { alert(`"${tooLarge.name}" is larger than the limit of ${formatBytes(STORAGE.max_file_size)}.`); return; }
+
+        uploading = true;
+        abortController = new AbortController();
+        uploadBtn.disabled = true;
+        stopBtn.classList.remove('is-hidden');
+        progressWrap.style.display = 'block';
+        renderPending();
+
+        const uploader = new E2EUploader(ALBUM_ID, recipients);
+        const files = selectedFiles.filter(f => (fileState.get(f) || {}).state !== 'done');
+        const totalBytes = files.reduce((sum, f) => sum + f.size, 0) || 1;
+        const sentByFile = new Map();
+        const startedAt = performance.now();
+        let failures = 0;
+
+        const overall = () => {
+            const sent = [...sentByFile.values()].reduce((a, b) => a + b, 0);
+            const seconds = (performance.now() - startedAt) / 1000;
+            const speed = seconds > 1 ? ` • ${formatBytes(sent / seconds)}/s` : '';
+            progressBar.style.width = `${Math.min(100, (sent / totalBytes) * 100)}%`;
+            progressLbl.textContent = `${formatBytes(sent)} of ${formatBytes(totalBytes)}${speed}`;
+        };
+
+        for (const file of files) {
+            if (abortController.signal.aborted) break;
+            try {
+                setFileState(file, { status: 'Preparing…', state: 'active' });
+                const resume = await E2EUploader.findResumable(file, pendingUploads);
+                const fileType = mediaFileType(file);
+                const thumbnail = !resume && fileType === 'video' ? await generateVideoThumbnailDataUrl(file) : '';
+                let lastRender = 0;
+                await uploader.upload(file, {
+                    fileType,
+                    thumbnailDataUrl: thumbnail,
+                    resume,
+                    signal: abortController.signal,
+                    onProgress: (sent, total) => {
+                        // sent/total are encrypted bytes; close enough to the file size for display
+                        const plainSent = Math.min(file.size, Math.round((sent / total) * file.size));
+                        sentByFile.set(file, plainSent);
+                        overall();
+                        const now = performance.now();
+                        if (now - lastRender > 200 || sent === total) {
+                            lastRender = now;
+                            const label = resume && sent === resume.received ? 'Resuming…' : '🔐 Encrypting & uploading…';
+                            setFileState(file, { status: `${label} ${Math.floor((sent / total) * 100)}%`, sent, total });
+                        }
+                    },
+                });
+                if (resume) pendingUploads = pendingUploads.filter(p => p.token !== resume.token);
+                setFileState(file, { status: '✅ Uploaded', state: 'done', sent: 1, total: 1 });
+            } catch (err) {
+                failures += 1;
+                const stopped = err.name === 'AbortError';
+                setFileState(file, { status: stopped ? '⏸ Stopped (resumable)' : `❌ ${err.message}`, state: 'error' });
+                if (stopped) break;
+                console.error(`Upload failed for ${file.name}:`, err);
+            }
+        }
+
+        uploading = false;
+        stopBtn.classList.add('is-hidden');
+        renderFileList();
+        await loadPending();
+
+        if (!failures && !abortController.signal.aborted) {
+            progressLbl.textContent = 'Upload complete! Redirecting…';
+            window.location.href = ALBUM_URL;
+        } else {
+            progressLbl.textContent = abortController.signal.aborted
+                ? 'Stopped. Press "Encrypt & Upload" to continue.'
+                : `${failures} file(s) failed. Press "Encrypt & Upload" to retry; finished files are kept.`;
+            uploadBtn.disabled = false;
+        }
+    });
+
+    await waitForE2E();
+    await loadPending();
+})();
+</script>
+{% endblock %}

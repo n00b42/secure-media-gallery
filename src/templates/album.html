@@ -1,0 +1,562 @@
+{% extends "base.html" %}
+
+{% block title %}{{ album.title }} - Secure Media Gallery{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{{ asset_url('css/pages/album.css') }}">
+{% endblock %}
+
+{% block content %}
+<div class="album-header">
+    <div class="album-info">
+        <h2>{{ album.title }}</h2>
+        {% if album.description %}<p>{{ album.description }}</p>{% endif %}
+        <p class="album-meta-note">
+            Created {{ album.created_at.strftime('%Y-%m-%d') }}
+            {% if album.shared_users %}| Shared with {{ album.shared_users|length }} user(s){% endif %}
+        </p>
+    </div>
+    <div class="album-actions">
+        <a href="{{ url_for('album.upload_media', album_id=album.id) }}" class="btn">+ Upload</a>
+        {% if is_owner %}
+        <a href="{{ url_for('album.edit_album', album_id=album.id) }}" class="btn btn-secondary">Edit</a>
+        <a href="{{ url_for('album.share_album', album_id=album.id) }}" class="btn btn-secondary">Share</a>
+        <form method="POST"
+              action="{{ url_for('album.delete_album', album_id=album.id) }}"
+              class="album-delete-form"
+              data-confirm="Delete this album and all media in it?">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-danger">Delete Album</button>
+        </form>
+        {% endif %}
+        <a href="{{ url_for('gallery.dashboard') }}" class="btn btn-secondary">Back</a>
+    </div>
+</div>
+
+{% if media %}
+<div class="media-grid" id="mediaGrid">
+    {% for item in media %}
+    <div class="media-card" id="card-{{ item.id }}"
+         data-media-id="{{ item.id }}"
+         data-file-type="{{ item.file_type }}"
+         data-filename=""
+         data-created-at="{{ item.created_at.strftime('%Y-%m-%d %H:%M') }}"
+         data-file-size="{{ item.file_size or 0 }}"
+         data-video-thumbnail="{{ item.video_thumbnail_data or '' }}">
+
+        <div class="media-placeholder" id="placeholder-{{ item.id }}">
+            <div class="spinner"></div>
+            <span>Decrypting…</span>
+        </div>
+
+        <div class="media-overlay" id="overlay-{{ item.id }}">
+            <button
+                type="button"
+                class="overlay-icon-btn media-info-btn js-media-info-btn"
+                data-media-id="{{ item.id }}"
+                title="File info"
+                aria-label="View file info">i</button>
+            <button
+                type="button"
+                class="overlay-icon-btn media-download-btn js-media-download-btn"
+                data-media-id="{{ item.id }}"
+                title="Download (decrypted)"
+                aria-label="Download decrypted file">⬇</button>
+            {% if is_owner %}
+            <form method="POST"
+                  action="{{ url_for('album.delete_media', album_id=album.id, media_id=item.id) }}"
+                  class="inline-form"
+                  data-confirm="Delete this media?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="overlay-icon-btn delete-icon-btn" title="Delete media" aria-label="Delete media">🗑</button>
+            </form>
+            {% endif %}
+        </div>
+
+        <div class="media-info-popover is-hidden" id="info-popover-{{ item.id }}"></div>
+
+        {% if item.file_type == 'video' %}
+        <span class="media-type-badge">🎬</span>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <p>📭 No media in this album yet</p>
+    <a href="{{ url_for('album.upload_media', album_id=album.id) }}" class="btn">Upload Your First Media</a>
+</div>
+{% endif %}
+
+<!-- Lightbox -->
+<div id="lightbox">
+    <button id="lightbox-close" type="button" aria-label="Close">✕</button>
+    <button id="lightbox-info-toggle" title="File info" aria-label="Toggle file info">i</button>
+    <button id="lightbox-download" type="button" title="Download (decrypted)" aria-label="Download decrypted file">⬇</button>
+    <div id="lightbox-spinner"><div class="spinner"></div><span>Decrypting…</span></div>
+    <img id="lightbox-img" class="media-thumb" alt="">
+    <video id="lightbox-vid" controls></video>
+    <div id="lightbox-filename"></div>
+    <div id="lightbox-info-panel" class="is-hidden"></div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script nonce="{{ csp_nonce }}">
+(async () => {
+    // Cache of already-decrypted object URLs: mediaId → { url, fileType, filename }
+    const decryptedCache = {};
+    const posterCache = {};
+    let lightboxCurrentUrl = null;
+    let lightboxOwnsUrl = false;
+    const cards = Array.from(document.querySelectorAll('.media-card'));
+    const cardIds = Array.from(document.querySelectorAll('.media-card')).map(card => parseInt(card.dataset.mediaId));
+    let currentLightboxMediaId = null;
+
+    function escapeHtml(value) {
+        return String(value || '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/\"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes <= 0) return 'Unknown';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let value = bytes;
+        let unit = 0;
+        while (value >= 1024 && unit < units.length - 1) {
+            value /= 1024;
+            unit += 1;
+        }
+        return `${value.toFixed(unit === 0 ? 0 : 2)} ${units[unit]}`;
+    }
+
+    function getMediaMeta(mediaId) {
+        const card = document.getElementById(`card-${mediaId}`);
+        if (!card) return null;
+        return {
+            filename: card.dataset.filename || '🔒 (not decrypted yet)',
+            fileType: card.dataset.fileType || 'unknown',
+            createdAt: card.dataset.createdAt || 'Unknown',
+            fileSize: Number.parseInt(card.dataset.fileSize || '0', 10),
+        };
+    }
+
+    function guessMime(filename) {
+        const ext = String(filename || '').split('.').pop().toLowerCase();
+        const map = {
+            mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+            avi: 'video/x-msvideo', mkv: 'video/x-matroska',
+        };
+        return map[ext] || 'application/octet-stream';
+    }
+
+    function resetVideo(video) {
+        video.pause();
+        video.removeAttribute('src');
+        while (video.firstChild) video.removeChild(video.firstChild);
+        video.load();
+    }
+
+    function setVideoBlobSource(video, url, filename, preload = 'metadata') {
+        resetVideo(video);
+        video.preload = preload;
+        video.playsInline = true;
+        const source = document.createElement('source');
+        source.src = url;
+        source.type = guessMime(filename);
+        video.appendChild(source);
+        video.load();
+    }
+
+    function renderLightboxInfo(mediaId) {
+        const panel = document.getElementById('lightbox-info-panel');
+        const meta = getMediaMeta(mediaId);
+        if (!panel || !meta) return;
+
+        panel.innerHTML = `
+            <div><strong>Name:</strong> ${escapeHtml(meta.filename)}</div>
+            <div><strong>Type:</strong> ${escapeHtml(meta.fileType)}</div>
+            <div><strong>Uploaded:</strong> ${escapeHtml(meta.createdAt)}</div>
+            <div><strong>Size:</strong> ${escapeHtml(formatBytes(meta.fileSize))}</div>
+        `;
+    }
+
+    function renderCardInfo(mediaId) {
+        const popover = document.getElementById(`info-popover-${mediaId}`);
+        const meta = getMediaMeta(mediaId);
+        if (!popover || !meta) return;
+
+        popover.innerHTML = `
+            <div><strong>Name:</strong> ${escapeHtml(meta.filename)}</div>
+            <div><strong>Type:</strong> ${escapeHtml(meta.fileType)}</div>
+            <div><strong>Uploaded:</strong> ${escapeHtml(meta.createdAt)}</div>
+            <div><strong>Size:</strong> ${escapeHtml(formatBytes(meta.fileSize))}</div>
+        `;
+    }
+
+    function hideAllCardInfoPopovers() {
+        for (const popover of document.querySelectorAll('.media-info-popover')) {
+            popover.classList.add('is-hidden');
+        }
+    }
+
+    function buildFallbackVideoPoster(filename) {
+        const label = (String(filename || 'VID').trim().slice(0, 3).toUpperCase() || 'VID')
+            .replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+        const svg = `
+            <svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+                <defs>
+                    <linearGradient id="videoGrad" x1="0" y1="0" x2="1" y2="1">
+                        <stop offset="0%" stop-color="#1f2937"/>
+                        <stop offset="100%" stop-color="#111827"/>
+                    </linearGradient>
+                </defs>
+                <rect width="640" height="640" rx="28" fill="url(#videoGrad)"/>
+                <circle cx="320" cy="300" r="108" fill="rgba(255,255,255,0.14)"/>
+                <polygon points="288,238 288,362 392,300" fill="#ffffff"/>
+                <text x="320" y="510" text-anchor="middle" fill="#e5e7eb" font-size="64" font-family="Arial, sans-serif" font-weight="700">${label}</text>
+            </svg>
+        `;
+        return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+    }
+
+    async function loadVideoPoster(mediaId, privateKey, fallbackPoster) {
+        const card = document.getElementById(`card-${mediaId}`);
+        const storedPoster = card ? card.dataset.videoThumbnail || '' : '';
+        if (!storedPoster) return fallbackPoster;
+
+        if (!storedPoster.trim().startsWith('{')) {
+            return fallbackPoster;
+        }
+
+        return e2e.decryptVideoPoster(mediaId, privateKey, storedPoster);
+    }
+
+    // The original file name is stored encrypted; decrypt it with the file key.
+    async function resolveFilename(mediaId) {
+        const card = document.getElementById(`card-${mediaId}`);
+        try {
+            const { filename } = await e2e.getMediaContext(mediaId, privateKey);
+            if (card) card.dataset.filename = filename;
+            return filename;
+        } catch {
+            return '';
+        }
+    }
+
+    // ── Wait for private key ───────────────────────────────────────────────
+    function waitForE2E() {
+        return new Promise(resolve => {
+            if (window.__e2eReady) { resolve(); return; }
+            window.addEventListener('e2e-ready', resolve, { once: true });
+        });
+    }
+
+    await waitForE2E();
+    const privateKey = window.__e2ePrivateKey;
+    if (!privateKey) {
+        // Happens in private/incognito windows when local private key is unavailable.
+        for (const card of Array.from(document.querySelectorAll('.media-card'))) {
+            const id = parseInt(card.dataset.mediaId);
+            const placeholder = document.getElementById(`placeholder-${id}`);
+            placeholder.innerHTML = '<span class="media-state-message media-state-message-warning">🔒 Private key unavailable in this browser</span>';
+        }
+        return;
+    }
+
+    // ── Decrypt a single media item and show thumbnail ────────────────────
+    async function decryptAndShowThumb(mediaId, fileType) {
+        if (fileType === 'video' && posterCache[mediaId]) return;
+        if (fileType === 'image' && decryptedCache[mediaId]) return;
+
+        const card = document.getElementById(`card-${mediaId}`);
+        const placeholder = document.getElementById(`placeholder-${mediaId}`);
+        const overlay = document.getElementById(`overlay-${mediaId}`);
+
+        if (fileType === 'video') {
+            // Do not decrypt full videos for grid thumbnails; this avoids large-memory
+            // spikes in Firefox and keeps playback reliable in lightbox.
+            const filename = await resolveFilename(mediaId);
+            const fallbackPoster = buildFallbackVideoPoster(filename);
+            let poster = fallbackPoster;
+            try {
+                poster = await loadVideoPoster(mediaId, privateKey, fallbackPoster);
+            } catch (err) {
+                console.warn('Could not decrypt video thumbnail:', err);
+            }
+
+            placeholder.style.display = 'none';
+            const img = document.createElement('img');
+            img.src = poster;
+            img.className = 'media-thumb';
+            img.alt = filename;
+            img.setAttribute('aria-label', filename);
+            card.insertBefore(img, overlay);
+            posterCache[mediaId] = poster;
+            overlay.style.display = '';
+            return;
+        }
+
+        try {
+            const { url, filename } = await e2e.fetchAndDecrypt(mediaId, privateKey);
+            card.dataset.filename = filename;
+
+            placeholder.style.display = 'none';
+
+            const img = document.createElement('img');
+            img.src = url;
+            img.className = 'media-thumb';
+            img.alt = filename;
+            card.insertBefore(img, overlay);
+            decryptedCache[mediaId] = { url, fileType, filename };
+
+            overlay.style.display = '';
+        } catch (err) {
+            const placeholder = document.getElementById(`placeholder-${mediaId}`);
+            const details = (err && err.message) ? err.message : 'Unknown error';
+            const msg = details.includes('Key fetch failed: 404')
+                ? 'No key for this file'
+                : 'Wrong key or decrypt error';
+            placeholder.innerHTML = `<span class="media-state-message media-state-message-error">⚠️ Decrypt failed<br>${msg}</span>`;
+            if (decryptedCache[mediaId] && fileType === 'video') {
+                URL.revokeObjectURL(decryptedCache[mediaId].url);
+                delete decryptedCache[mediaId];
+            }
+        }
+    }
+
+    function releaseUrl(url) {
+        if (e2eStream.isStreamUrl(url)) e2eStream.release(url);
+        else URL.revokeObjectURL(url);
+    }
+
+    // Videos are streamed: the service worker decrypts only the chunks the player
+    // asks for, so playback starts immediately and seeking works for any size.
+    async function loadLightboxVideo(mediaId) {
+        if (lightboxOwnsUrl && lightboxCurrentUrl) {
+            releaseUrl(lightboxCurrentUrl);
+            lightboxCurrentUrl = null;
+            lightboxOwnsUrl = false;
+        }
+
+        const info = await e2e.mediaFileInfo(mediaId, privateKey);
+        let url = await e2eStream.url(info);
+        if (!url) {
+            if (info.plainSize > E2E_IN_MEMORY_LIMIT) {
+                throw new Error('Streaming is unavailable in this browser window; reload the page to play large videos.');
+            }
+            url = (await e2e.fetchAndDecrypt(mediaId, privateKey)).url;
+        }
+        lightboxCurrentUrl = url;
+        lightboxOwnsUrl = true;
+        return url;
+    }
+
+    async function downloadMedia(mediaId, button) {
+        if (button) button.disabled = true;
+        try {
+            await e2eDownloadMedia(mediaId, privateKey);
+        } catch (err) {
+            alert(`Download failed: ${err.message}`);
+        } finally {
+            if (button) setTimeout(() => { button.disabled = false; }, 1500);
+        }
+    }
+
+    // ── Lightbox ───────────────────────────────────────────────────────────
+    window.openLightbox = async function(mediaId) {
+        const lb         = document.getElementById('lightbox');
+        const spinner    = document.getElementById('lightbox-spinner');
+        const img        = document.getElementById('lightbox-img');
+        const vid        = document.getElementById('lightbox-vid');
+        const filenameLbl= document.getElementById('lightbox-filename');
+        const infoPanel  = document.getElementById('lightbox-info-panel');
+        currentLightboxMediaId = mediaId;
+
+        img.style.display = 'none';
+        vid.style.display = 'none';
+        spinner.style.display = 'flex';
+        lb.classList.add('active');
+        document.body.classList.add('lightbox-open');
+        hideAllCardInfoPopovers();
+        infoPanel.classList.add('is-hidden');
+        renderLightboxInfo(mediaId);
+
+        const card = document.getElementById(`card-${mediaId}`);
+        const fileType = card.dataset.fileType;
+
+        let cached = decryptedCache[mediaId];
+        if (!cached && fileType === 'image') {
+            await decryptAndShowThumb(mediaId, fileType);
+            cached = decryptedCache[mediaId];
+        }
+
+        if (!cached && fileType === 'video') {
+            try {
+                lightboxCurrentUrl = await loadLightboxVideo(mediaId);
+            } catch (err) {
+                spinner.style.display = 'none';
+                alert(`Could not play this video: ${err.message}`);
+                window.closeLightbox();
+                return;
+            }
+        } else if (!cached) {
+            spinner.style.display = 'none';
+            alert('Could not decrypt this file.');
+            lb.classList.remove('active');
+            return;
+        }
+
+        if (cached) {
+            lightboxCurrentUrl = cached.url;
+            lightboxOwnsUrl = false;
+            filenameLbl.textContent = cached.filename;
+        } else {
+            filenameLbl.textContent = card.dataset.filename;
+        }
+        spinner.style.display = 'none';
+
+        if ((cached && cached.fileType === 'image') || fileType === 'image') {
+            img.src = cached ? cached.url : lightboxCurrentUrl;
+            img.style.display = '';
+        } else {
+            setVideoBlobSource(vid, lightboxCurrentUrl, card.dataset.filename, 'metadata');
+            vid.style.display = '';
+        }
+    };
+
+    window.closeLightbox = function() {
+        const lb = document.getElementById('lightbox');
+        const infoPanel = document.getElementById('lightbox-info-panel');
+        lb.classList.remove('active');
+        const vid = document.getElementById('lightbox-vid');
+        resetVideo(vid);
+        document.body.classList.remove('lightbox-open');
+        infoPanel.classList.add('is-hidden');
+        if (lightboxOwnsUrl && lightboxCurrentUrl) {
+            releaseUrl(lightboxCurrentUrl);
+            lightboxCurrentUrl = null;
+            lightboxOwnsUrl = false;
+        }
+        currentLightboxMediaId = null;
+    };
+
+    window.showFileInfo = function(mediaId, event) {
+        if (event) event.stopPropagation();
+        if (isLightboxOpen()) return;
+
+        const popover = document.getElementById(`info-popover-${mediaId}`);
+        if (!popover) return;
+
+        const shouldShow = popover.classList.contains('is-hidden');
+        hideAllCardInfoPopovers();
+        if (!shouldShow) return;
+
+        renderCardInfo(mediaId);
+        popover.classList.remove('is-hidden');
+    };
+
+    function isLightboxOpen() {
+        return document.getElementById('lightbox').classList.contains('active');
+    }
+
+    async function openAdjacentMedia(direction) {
+        if (!isLightboxOpen() || currentLightboxMediaId === null) return;
+        if (!cardIds.length) return;
+
+        const currentIndex = cardIds.indexOf(currentLightboxMediaId);
+        if (currentIndex === -1) return;
+
+        const nextIndex = (currentIndex + direction + cardIds.length) % cardIds.length;
+        const nextId = cardIds[nextIndex];
+        await window.openLightbox(nextId);
+    }
+
+    for (const card of cards) {
+        const mediaId = Number.parseInt(card.dataset.mediaId || '', 10);
+        if (!Number.isInteger(mediaId)) continue;
+
+        card.addEventListener('click', (event) => {
+            if (event.target.closest('button') || event.target.closest('form')) return;
+            window.openLightbox(mediaId);
+        });
+    }
+
+    for (const infoBtn of document.querySelectorAll('.js-media-info-btn')) {
+        infoBtn.addEventListener('click', (event) => {
+            const mediaId = Number.parseInt(infoBtn.dataset.mediaId || '', 10);
+            if (!Number.isInteger(mediaId)) return;
+            window.showFileInfo(mediaId, event);
+        });
+    }
+
+    document.addEventListener('click', () => {
+        hideAllCardInfoPopovers();
+    });
+
+    document.getElementById('lightbox-close').addEventListener('click', () => window.closeLightbox());
+
+    for (const button of document.querySelectorAll('.js-media-download-btn')) {
+        button.addEventListener('click', (event) => {
+            event.stopPropagation();
+            downloadMedia(Number.parseInt(button.dataset.mediaId, 10), button);
+        });
+    }
+
+    document.getElementById('lightbox-download').addEventListener('click', (event) => {
+        if (currentLightboxMediaId !== null) downloadMedia(currentLightboxMediaId, event.currentTarget);
+    });
+
+    document.getElementById('lightbox-info-toggle').addEventListener('click', () => {
+        if (currentLightboxMediaId === null) return;
+        const panel = document.getElementById('lightbox-info-panel');
+        renderLightboxInfo(currentLightboxMediaId);
+        panel.classList.toggle('is-hidden');
+    });
+
+    document.addEventListener('keydown', async (e) => {
+        if (e.key === 'Escape') {
+            closeLightbox();
+            return;
+        }
+        if (e.key === 'ArrowRight') {
+            await openAdjacentMedia(1);
+            return;
+        }
+        if (e.key === 'ArrowLeft') {
+            await openAdjacentMedia(-1);
+            return;
+        }
+        if (e.key.toLowerCase() === 'i' && isLightboxOpen()) {
+            document.getElementById('lightbox-info-toggle').click();
+        }
+    });
+
+    // ── Decrypt all thumbnails (in parallel, capped per type) ─────────────
+
+    async function decryptBatch(items, concurrency = 3) {
+        let i = 0;
+        async function worker() {
+            while (i < items.length) {
+                const card = items[i++];
+                const id       = parseInt(card.dataset.mediaId);
+                const fileType = card.dataset.fileType;
+                await decryptAndShowThumb(id, fileType);
+            }
+        }
+        const workers = Array.from({ length: concurrency }, worker);
+        await Promise.all(workers);
+    }
+
+    await Promise.all([
+        decryptBatch(cards.filter(card => card.dataset.fileType !== 'video'), 3),
+        decryptBatch(cards.filter(card => card.dataset.fileType === 'video'), 1),
+    ]);
+
+})();
+</script>
+{% endblock %}

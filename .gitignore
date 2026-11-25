@@ -1,0 +1,22 @@
+*.pyc
+__pycache__/
+*.db
+*.sqlite
+.env
+venv/
+.vscode/
+.idea/
+# Runtime data (DATA_DIR): database + encrypted uploads
+/data/
+/run/
+/instance/
+/uploads/
+.DS_Store
+temp_*
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/

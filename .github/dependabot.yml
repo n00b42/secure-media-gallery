@@ -1,0 +1,29 @@
+# Dependabot: weekly update pull requests plus immediate security alerts/PRs
+# (security updates also need "Dependabot security updates" enabled under
+# Settings → Code security).
+version: 2
+updates:
+  # Python dependencies (pyproject.toml + poetry.lock)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor updates in one PR; major updates get their own PRs.
+      python-minor-and-patch:
+        update-types: [minor, patch]
+
+  # Base image in the Dockerfile (python:3.12-slim)
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Actions used in .github/workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
